@@ -4,6 +4,8 @@
     feature = "vendored-openssl"
 ))]
 use crate::client::{tls::TlsPreloginWrapper, tls_stream::create_tls_stream};
+#[cfg(feature="aad")]
+use crate::tds::codec::TokenFedAuthInfo;
 use crate::{
     client::{tls::MaybeTlsStream, AuthMethod, Config},
     tds::{
@@ -88,6 +90,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             buf: BytesMut::new(),
         };
 
+        #[cfg(feature="aad")]
+        let fed_auth_required = matches!(config.auth, 
+            AuthMethod::AADToken(_) 
+            | AuthMethod::AADManagedIdentity(_)
+            | AuthMethod::AADServicePrincipal(_)    
+        );
+        #[cfg(not(feature="aad"))]
         let fed_auth_required = matches!(config.auth, AuthMethod::AADToken(_));
 
         let prelogin = connection
@@ -124,6 +133,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     /// Flush the incoming token stream until receiving `SSPI` token.
     async fn flush_sspi(&mut self) -> crate::Result<TokenSspi> {
         TokenStream::new(self).flush_sspi().await
+    }
+
+    #[cfg(feature="aad")]
+    /// Flush the incoming token stream until receiving `FEDAUTHINFO` token.
+    async fn flush_fed_auth_info(&mut self) -> crate::Result<TokenFedAuthInfo> {
+        TokenStream::new(self).flush_fed_auth_info().await
     }
 
     #[cfg(any(
@@ -420,11 +435,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 let id = self.context.next_packet_id();
                 self.send(PacketHeader::login(id), login_message).await?;
                 self = self.post_login_encryption(encryption);
-            }
+            },
             AuthMethod::AADToken(token) => {
                 login_message.aad_token(token, prelogin.fed_auth_required, prelogin.nonce);
                 let id = self.context.next_packet_id();
                 self.send(PacketHeader::login(id), login_message).await?;
+                self = self.post_login_encryption(encryption);
+            },
+            #[cfg(feature="aad")]
+            AuthMethod::AADManagedIdentity(auth) => {
+                login_message.aad_managed_identity(prelogin.fed_auth_required);
+                let id = self.context.next_packet_id();
+                self.send(PacketHeader::login(id), login_message).await?;
+
+                // federated authentication
+                let fed_auth_info = self.flush_fed_auth_info().await?;
+                self.authenticate_managed_identity(&auth, &fed_auth_info).await?;
+                self = self.post_login_encryption(encryption);
+            },
+            #[cfg(feature="aad")]
+            AuthMethod::AADServicePrincipal(auth) => {
+                login_message.aad_service_principal(prelogin.fed_auth_required);
+                let id = self.context.next_packet_id();
+                self.send(PacketHeader::login(id), login_message).await?;
+
+                // federated authentication
+                let fed_auth_info = self.flush_fed_auth_info().await?;
+                self.authenticate_service_principal(&auth, &fed_auth_info).await?;
                 self = self.post_login_encryption(encryption);
             }
         }
@@ -571,5 +608,102 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SqlReadBytes for Connection<S> {
     /// A mutable reference to the current execution context.
     fn context_mut(&mut self) -> &mut Context {
         &mut self.context
+    }
+}
+
+/// Federated authentication via a token obtained for a managed identity or service principal.
+#[cfg(feature="aad")]
+mod aad {
+    use std::borrow::Cow;
+    use azure_core::auth::{TokenCredential, AccessToken};
+    use azure_identity::{ImdsManagedIdentityCredential, DefaultAzureCredential, DefaultAzureCredentialEnum, TokenCredentialOptions, ClientSecretCredential};
+    use futures_util::{AsyncRead, AsyncWrite};
+    use crate::{client::{AADManagedIdentityAuth, AADServicePrincipalAuth}, tds::codec::{TokenFedAuthInfo, FedAuthToken, PacketHeader}, error::Error};
+    use super::Connection;
+
+    const DEFAULT_SCOPE_SUFFIX: &str = "/.default";
+
+    impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
+        /// Authenticate a managed identity with an optional client id based on the federated authentication information.
+        pub(super) async fn authenticate_managed_identity(&mut self, auth: &AADManagedIdentityAuth, 
+            fed_auth_info: &TokenFedAuthInfo)
+        -> crate::Result<()> 
+        {
+            let mut managed_identity_credential = ImdsManagedIdentityCredential::default();
+            if let Some(client_id) = auth.client_id() {
+                managed_identity_credential = managed_identity_credential.with_client_id(client_id);
+            }
+            let msi_credential_flow = DefaultAzureCredential::with_sources(vec![
+                DefaultAzureCredentialEnum::ManagedIdentity(managed_identity_credential)
+            ]);
+
+            let spn = fed_auth_info.spn();
+            let scope = Self::get_scope(spn);
+
+            if let Ok(access_token) = msi_credential_flow.get_token(&[scope.as_ref()]).await {
+                self.send_fed_auth_token(access_token).await
+            } else {
+                Err(Error::Protocol("Failed to retrieve federated auth token for managed identity".into()))
+            }
+        }
+
+        /// Authenticate a service principal with a client id and secret based on the federated authentication information.
+        pub(super) async fn authenticate_service_principal(&mut self, auth: &AADServicePrincipalAuth, 
+            fed_auth_info: &TokenFedAuthInfo) 
+        -> crate::Result<()> 
+        {
+            let (sts_url, spn) = (fed_auth_info.sts_url(), fed_auth_info.spn());
+                    let separator_index = 
+                        sts_url.len() 
+                            - 1 
+                            - sts_url
+                                .bytes()
+                                .rev()
+                                .position(|b| b == b'/')
+                                .ok_or(Error::Protocol(
+                                    "Received an invalid sts_url in federated authentication info".into()
+                                ))?;
+            let authority = &sts_url[..separator_index];
+            let audience = &sts_url[separator_index + 1..];
+
+            let credential_options = TokenCredentialOptions::new(
+                azure_core::Url::parse(authority).unwrap());
+            
+            let client_credential_flow = ClientSecretCredential::new(
+                azure_core::new_http_client(),
+                audience.to_string(), 
+                auth.client_id().to_string(), 
+                auth.client_secret().to_string(),
+                credential_options
+            );
+
+            let scope = Self::get_scope(spn);
+            
+            if let Ok(access_token) = client_credential_flow.get_token(&[scope.as_ref()]).await {
+                self.send_fed_auth_token(access_token).await
+            } else {
+                Err(Error::Protocol("Failed to retrieve federated auth token for service principal".into()))
+            }
+        }
+
+        /// Constructs and sends the FEDAUTH token (0x08) with the provided access token.
+        #[inline]
+        async fn send_fed_auth_token(&mut self, access_token: AccessToken) -> crate::Result<()> {
+            let fed_auth_token_message = FedAuthToken::new(access_token.token.secret());
+            let id = self.context.next_packet_id();
+            self.send(PacketHeader::fed_auth_token(id), fed_auth_token_message).await?;
+            Ok(())
+        }
+
+        /// Constructs a scope with suffix `/.default`.
+        #[inline]
+        fn get_scope(spn: &str) -> Cow<'_, str> {
+            if spn.ends_with(DEFAULT_SCOPE_SUFFIX) { 
+                spn.into()
+            } 
+            else {
+                format!("{}{DEFAULT_SCOPE_SUFFIX}", spn.trim_end_matches('/')).into()
+            }
+        }
     }
 }

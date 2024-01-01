@@ -132,14 +132,35 @@ pub enum LoginTypeFlag {
 pub(crate) const FEA_EXT_FEDAUTH: u8 = 0x02u8;
 pub(crate) const FEA_EXT_TERMINATOR: u8 = 0xFFu8;
 pub(crate) const FED_AUTH_LIBRARYSECURITYTOKEN: u8 = 0x01;
+#[cfg(feature="aad")]
+pub(crate) const FED_AUTH_LIBRARYMSAL: u8 = 0x02;
+#[cfg(feature="aad")]
+pub(crate) const MSALWORKFLOW_ACTIVEDIRECTORYSERVICEPRINCIPAL: u8 = 0x01;
+#[cfg(feature="aad")]
+pub(crate) const MSALWORKFLOW_ACTIVEDIRECTORYMANAGEDIDENTITY: u8 = 0x03;
 
 /// https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-tds/773a62b6-ee89-4c02-9e5e-344882630aac
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 struct FedAuthExt<'a> {
     fed_auth_echo: bool,
-    fed_auth_token: Cow<'a, str>,
-    nonce: Option<[u8; 32]>,
+    fed_auth_library: FedAuthLibrary<'a>
+}
+
+#[derive(Debug, Clone)]
+#[cfg(feature="aad")]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+enum MSALWorkflow {
+    ActiveDirectoryManagedIdentity,
+    ActiveDirectoryServicePrincipal
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+enum FedAuthLibrary<'a> {
+    #[cfg(feature="aad")]
+    MSAL(MSALWorkflow),
+    SecurityToken{token: Cow<'a, str>, nonce: Option<[u8; 32]>}
 }
 
 /// the login packet
@@ -224,13 +245,17 @@ impl<'a> LoginMessage<'a> {
         fed_auth_echo: bool,
         nonce: Option<[u8; 32]>,
     ) {
-        self.option_flags_3.insert(OptionFlag3::ExtensionUsed);
+        self.fed_auth(FedAuthLibrary::SecurityToken{ token: token.into(), nonce }, fed_auth_echo)
+    }
 
-        self.fed_auth_ext = Some(FedAuthExt {
-            fed_auth_echo,
-            fed_auth_token: token.into(),
-            nonce,
-        })
+    #[cfg(feature="aad")]
+    pub fn aad_managed_identity(&mut self, fed_auth_echo: bool) {
+        self.fed_auth(FedAuthLibrary::MSAL(MSALWorkflow::ActiveDirectoryManagedIdentity), fed_auth_echo);
+    }
+
+    #[cfg(feature="aad")]
+    pub fn aad_service_principal(&mut self, fed_auth_echo: bool) {
+        self.fed_auth(FedAuthLibrary::MSAL(MSALWorkflow::ActiveDirectoryServicePrincipal), fed_auth_echo);
     }
 
     pub fn readonly(&mut self, readonly: bool) {
@@ -239,6 +264,15 @@ impl<'a> LoginMessage<'a> {
         } else {
             self.type_flags.remove(LoginTypeFlag::ReadOnlyIntent);
         }
+    }
+
+    fn fed_auth(&mut self, fed_auth_library: FedAuthLibrary<'a>, fed_auth_echo: bool) {
+        self.option_flags_3.insert(OptionFlag3::ExtensionUsed);
+
+        self.fed_auth_ext = Some(FedAuthExt { 
+            fed_auth_echo,
+            fed_auth_library
+        });
     }
 }
 
@@ -362,30 +396,49 @@ impl<'a> Encode<BytesMut> for LoginMessage<'a> {
 
             cursor.write_u8(FEA_EXT_FEDAUTH)?;
 
-            let mut token = Cursor::new(Vec::new());
-            for codepoint in fed_auth_ext.fed_auth_token.encode_utf16() {
-                token.write_u16::<LittleEndian>(codepoint)?;
-            }
-            let token = token.into_inner();
+            match fed_auth_ext.fed_auth_library {
+                #[cfg(feature="aad")]
+                FedAuthLibrary::MSAL(msal) => {
+                    // bFedAuthLibrary (7 bit) + fFedAuthEcho (1 bit) + Workflow (1 byte)
+                    let feature_ext_length = 2;
+                    cursor.write_u32::<LittleEndian>(feature_ext_length)?;
 
-            // options (1) + TokenLength(4) + Token.length + nonce.length
-            let feature_ext_length =
-                1 + 4 + token.len() + if fed_auth_ext.nonce.is_some() { 32 } else { 0 };
+                    let options: u8 = (FED_AUTH_LIBRARYMSAL << 1) | if fed_auth_ext.fed_auth_echo { 1 } else { 0 };
+                    cursor.write_u8(options)?;
 
-            cursor.write_u32::<LittleEndian>(feature_ext_length as u32)?;
-
-            let mut options: u8 = FED_AUTH_LIBRARYSECURITYTOKEN << 1;
-            if fed_auth_ext.fed_auth_echo {
-                options |= 1 // fFedAuthEcho
-            }
-
-            cursor.write_u8(options)?;
-
-            cursor.write_u32::<LittleEndian>(token.len() as u32)?;
-            cursor.write_all(token.as_slice())?;
-
-            if let Some(nonce) = fed_auth_ext.nonce {
-                cursor.write_all(nonce.as_ref())?;
+                    let workflow = match msal {
+                        MSALWorkflow::ActiveDirectoryManagedIdentity => MSALWORKFLOW_ACTIVEDIRECTORYMANAGEDIDENTITY,
+                        MSALWorkflow::ActiveDirectoryServicePrincipal => MSALWORKFLOW_ACTIVEDIRECTORYSERVICEPRINCIPAL
+                    };
+                    cursor.write_u8(workflow)?;
+                },
+                FedAuthLibrary::SecurityToken{ token, nonce } => {
+                    let mut token_cursor = Cursor::new(Vec::new());
+                    for codepoint in token.encode_utf16() {
+                        token_cursor.write_u16::<LittleEndian>(codepoint)?;
+                    }
+                    let token = token_cursor.into_inner();
+        
+                    // options (1) + TokenLength(4) + Token.length + nonce.length
+                    let feature_ext_length =
+                        1 + 4 + token.len() + if nonce.is_some() { 32 } else { 0 };
+        
+                    cursor.write_u32::<LittleEndian>(feature_ext_length as u32)?;
+        
+                    let mut options: u8 = FED_AUTH_LIBRARYSECURITYTOKEN << 1; // 7-bit field
+                    if fed_auth_ext.fed_auth_echo {
+                        options |= 1 // fFedAuthEcho
+                    }
+        
+                    cursor.write_u8(options)?;
+        
+                    cursor.write_u32::<LittleEndian>(token.len() as u32)?;
+                    cursor.write_all(token.as_slice())?;
+        
+                    if let Some(nonce) = nonce {
+                        cursor.write_all(nonce.as_ref())?;
+                    }
+                }
             }
 
             cursor.write_u8(FEA_EXT_TERMINATOR)?;
@@ -522,30 +575,46 @@ mod tests {
                         let mut options = cursor.read_u8()?;
                         let fed_auth_echo = (options & 1) == 1;
                         options >>= 1;
-                        if options != FED_AUTH_LIBRARYSECURITYTOKEN {
-                            unimplemented!("unsupported FedAuthLibrary {:?}", options);
-                        }
-                        let token_len = cursor.read_u32::<LittleEndian>()? as usize;
-                        let mut token = vec![0u16; token_len / 2];
-                        cursor.read_u16_into::<LittleEndian>(&mut token)?;
-                        let token = String::from_utf16(&token).expect("decode utf16");
-                        let remaining = fea_ext_len - (cursor.position() - pos) as u32;
-                        let nonce = if remaining == 32 {
-                            let mut a = [0u8; 32];
-                            cursor.read_exact(&mut a)?;
-                            Some(a)
-                        } else if remaining == 0 {
-                            None
-                        } else {
-                            panic!("read feature ext fail: {}", remaining);
-                        };
 
-                        let fed_auth_ext = FedAuthExt {
-                            fed_auth_echo,
-                            fed_auth_token: token.into(),
-                            nonce,
-                        };
-                        ret.fed_auth_ext = Some(fed_auth_ext);
+                        match options {
+                            #[cfg(feature="aad")]
+                            FED_AUTH_LIBRARYMSAL => {
+                                let msal_workflow = match cursor.read_u8()? {
+                                    MSALWORKFLOW_ACTIVEDIRECTORYMANAGEDIDENTITY => MSALWorkflow::ActiveDirectoryManagedIdentity,
+                                    MSALWORKFLOW_ACTIVEDIRECTORYSERVICEPRINCIPAL => MSALWorkflow::ActiveDirectoryServicePrincipal,
+                                    n => unimplemented!("unsupported msal workflow: {n}", )
+                                };
+    
+                                let fed_auth_ext = FedAuthExt {
+                                    fed_auth_echo,
+                                    fed_auth_library: FedAuthLibrary::MSAL(msal_workflow)
+                                };
+                                ret.fed_auth_ext = Some(fed_auth_ext);
+                            },
+                            FED_AUTH_LIBRARYSECURITYTOKEN => {
+                                let token_len = cursor.read_u32::<LittleEndian>()? as usize;
+                                let mut token = vec![0u16; token_len / 2];
+                                cursor.read_u16_into::<LittleEndian>(&mut token)?;
+                                let token = String::from_utf16(&token).expect("decode utf16");
+                                let remaining = fea_ext_len - (cursor.position() - pos) as u32;
+                                let nonce = if remaining == 32 {
+                                    let mut a = [0u8; 32];
+                                    cursor.read_exact(&mut a)?;
+                                    Some(a)
+                                } else if remaining == 0 {
+                                    None
+                                } else {
+                                    panic!("read feature ext fail: {}", remaining);
+                                };
+    
+                                let fed_auth_ext = FedAuthExt {
+                                    fed_auth_echo,
+                                    fed_auth_library: FedAuthLibrary::SecurityToken{ token: token.into(), nonce }
+                                };
+                                ret.fed_auth_ext = Some(fed_auth_ext);
+                            },
+                            _ => unimplemented!("unsupported feature ext {:?}", fe)
+                        }                        
                     } else {
                         unimplemented!("unsupported feature ext {:?}", fe);
                     }
@@ -589,8 +658,7 @@ mod tests {
             login.fed_auth_ext.expect("fed_auto_specified"),
             FedAuthExt {
                 fed_auth_echo: true,
-                fed_auth_token: token.into(),
-                nonce: Some(nonce)
+                fed_auth_library: FedAuthLibrary::SecurityToken { token: token.into(), nonce: Some(nonce) }
             }
         )
     }
@@ -601,6 +669,70 @@ mod tests {
         let mut login = LoginMessage::new();
         let nonce = [1u8; 32];
         login.aad_token("fake-aad-token", true, Some(nonce));
+        login
+            .clone()
+            .encode(&mut payload)
+            .expect("encode should succeed");
+
+        let decoded = LoginMessage::decode(&mut payload).expect("decode should succeed");
+
+        assert_eq!(login, decoded);
+    }
+
+    #[test]
+    #[cfg(feature="aad")]
+    fn specify_managed_identity() {
+        let mut login = LoginMessage::new();
+        login.aad_managed_identity(true);
+        
+        assert!(login.option_flags_3.contains(OptionFlag3::ExtensionUsed));
+        assert_eq!(
+            login.fed_auth_ext.expect("fed auth ext should be specified"),
+            FedAuthExt {
+                fed_auth_echo: true,
+                fed_auth_library: FedAuthLibrary::MSAL(MSALWorkflow::ActiveDirectoryManagedIdentity)
+            }
+        )
+    }
+
+    #[test]
+    #[cfg(feature="aad")]
+    fn login_message_with_fed_auth_managed_identity_round_trip() {
+        let mut payload = BytesMut::new();
+        let mut login = LoginMessage::new();
+        login.aad_managed_identity(true);
+        login
+            .clone()
+            .encode(&mut payload)
+            .expect("encode should succeed");
+
+        let decoded = LoginMessage::decode(&mut payload).expect("decode should succeed");
+
+        assert_eq!(login, decoded);
+    }
+
+    #[test]
+    #[cfg(feature="aad")]
+    fn specify_service_principal() {
+        let mut login = LoginMessage::new();
+        login.aad_service_principal(true);
+        
+        assert!(login.option_flags_3.contains(OptionFlag3::ExtensionUsed));
+        assert_eq!(
+            login.fed_auth_ext.expect("fed auth ext should be specified"),
+            FedAuthExt {
+                fed_auth_echo: true,
+                fed_auth_library: FedAuthLibrary::MSAL(MSALWorkflow::ActiveDirectoryServicePrincipal)
+            }
+        )
+    }
+
+    #[test]
+    #[cfg(feature="aad")]
+    fn login_message_with_fed_auth_service_principal_round_trip() {
+        let mut payload = BytesMut::new();
+        let mut login = LoginMessage::new();
+        login.aad_service_principal(true);
         login
             .clone()
             .encode(&mut payload)

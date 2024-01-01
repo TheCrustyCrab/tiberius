@@ -46,6 +46,56 @@ impl Debug for WindowsAuth {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+#[cfg(feature="aad")]
+pub struct AADManagedIdentityAuth {
+    client_id: Option<String>
+}
+
+#[cfg(feature="aad")]
+impl AADManagedIdentityAuth {
+    pub(crate) fn client_id(&self) -> Option<&str> {
+        self.client_id.as_ref().map(String::as_ref)
+    }
+}
+
+#[cfg(feature="aad")]
+impl Debug for AADManagedIdentityAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AADManagedIdentityAuth")
+            .field("client_id", &self.client_id)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+#[cfg(feature="aad")]
+pub struct AADServicePrincipalAuth {
+    client_id: String,
+    client_secret: String
+}
+
+#[cfg(feature="aad")]
+impl AADServicePrincipalAuth {
+    pub(crate) fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    pub(crate) fn client_secret(&self) -> &str {
+        &self.client_secret
+    }
+}
+
+#[cfg(feature="aad")]
+impl Debug for AADServicePrincipalAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AADServicePrincipalAuth")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &self.client_secret)
+            .finish()
+    }
+}
+
 /// Defines the method of authentication to the server.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthMethod {
@@ -70,6 +120,12 @@ pub enum AuthMethod {
     /// Authenticate with an AAD token. The token should encode an AAD user/service principal
     /// which has access to SQL Server.
     AADToken(String),
+    /// Authenticate as a system-assigned or user-assigned managed identity with an optional client id.
+    #[cfg(feature="aad")]
+    AADManagedIdentity(AADManagedIdentityAuth),
+    /// Authenticate as a service principal with a client id and secret.
+    #[cfg(feature="aad")]
+    AADServicePrincipal(AADServicePrincipalAuth),
     #[doc(hidden)]
     None,
 }
@@ -102,5 +158,29 @@ impl AuthMethod {
     /// Construct a new configuration with AAD auth token.
     pub fn aad_token(token: impl ToString) -> Self {
         Self::AADToken(token.to_string())
+    }
+
+    /// Constructs a new AAD configuration to authenticate with a system-assigned managed identity 
+    /// or the single user-assigned managed identity.
+    /// In case there are multiple user-assigned managed identities, use `aad_managed_identity_with_client_id`.
+    #[cfg(feature="aad")]
+    pub fn aad_managed_identity() -> Self {
+        Self::AADManagedIdentity(AADManagedIdentityAuth { client_id: None })
+    }
+
+    /// Constructs a new AAD configuration to authenticate with a system-assigned 
+    /// or user-assigned managed identity with a specific client id.
+    #[cfg(feature="aad")]
+    pub fn aad_managed_identity_with_client_id(client_id: impl ToString) -> Self {
+        Self::AADManagedIdentity(AADManagedIdentityAuth { client_id: Some(client_id.to_string()) })
+    }
+
+    /// Constructs a new AAD service principal configuration.
+    #[cfg(feature="aad")]
+    pub fn aad_service_principal(client_id: impl ToString, client_secret: impl ToString) -> Self {
+        Self::AADServicePrincipal(AADServicePrincipalAuth { 
+            client_id: client_id.to_string(), 
+            client_secret: client_secret.to_string() 
+        })
     }
 }

@@ -9,7 +9,7 @@
 //!   - TENANT_ID: tenant id of service principal and sql instance;
 //!   - SERVER: SQL server URI
 use azure_identity::client_credentials_flow;
-use oauth2::{ClientId, ClientSecret};
+use oauth2::ClientId;
 use std::{env, sync::Arc};
 use tiberius::{AuthMethod, Client, Config, Query};
 use tokio::net::TcpStream;
@@ -20,9 +20,7 @@ async fn main() -> anyhow::Result<()> {
     // following code will retrive token with AAD Service Principal Auth
     let client_id =
         ClientId::new(env::var("CLIENT_ID").expect("Missing CLIENT_ID environment variable."));
-    let client_secret = ClientSecret::new(
-        env::var("CLIENT_SECRET").expect("Missing CLIENT_SECRET environment variable."),
-    );
+    let client_secret = env::var("CLIENT_SECRET").expect("Missing CLIENT_SECRET environment variable.");
     let tenant_id = env::var("TENANT_ID").expect("Missing TENANT_ID environment variable.");
 
     let client = Arc::new(reqwest::Client::new());

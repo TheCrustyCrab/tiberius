@@ -1,9 +1,11 @@
 use crate::tds::codec::TokenSspi;
+#[cfg(feature="aad")]
+use crate::tds::codec::TokenFedAuthInfo;
 use crate::{
     client::Connection,
     tds::codec::{
         TokenColMetaData, TokenDone, TokenEnvChange, TokenError, TokenFeatureExtAck, TokenInfo,
-        TokenLoginAck, TokenOrder, TokenReturnValue, TokenRow,
+        TokenLoginAck, TokenOrder, TokenReturnValue, TokenRow
     },
     Error, SqlReadBytes, TokenType,
 };
@@ -29,6 +31,8 @@ pub enum ReceivedToken {
     LoginAck(TokenLoginAck),
     Sspi(TokenSspi),
     FeatureExtAck(TokenFeatureExtAck),
+    #[cfg(feature="aad")]
+    FedAuthInfo(TokenFedAuthInfo),
     Error(TokenError),
 }
 
@@ -91,6 +95,37 @@ where
                 None => match last_error {
                     Some(err) => return Err(crate::Error::Server(err)),
                     None => return Err(crate::Error::Protocol("Never got SSPI token.".into())),
+                },
+            }
+        }
+    }
+
+    #[cfg(feature="aad")]
+    pub(crate) async fn flush_fed_auth_info(self) -> crate::Result<TokenFedAuthInfo> {
+        let mut stream = self.try_unfold();
+        let mut last_error = None;
+        let mut routing = None;
+
+        loop {
+            match stream.try_next().await? {
+                Some(ReceivedToken::Error(error)) => {
+                    if last_error.is_none() {
+                        last_error = Some(error);
+                    }
+                },
+                Some(ReceivedToken::Done(_)) => match (last_error, routing) {
+                    (Some(error), _) => return Err(Error::Server(error)),
+                    (_, Some(routing)) => return Err(routing),
+                    (_, _) => return Err(crate::Error::Protocol("Never got FEDAUTHINFO token.".into())),
+                },
+                Some(ReceivedToken::FedAuthInfo(token)) => return Ok(token),
+                Some(ReceivedToken::EnvChange(TokenEnvChange::Routing { host, port })) => {
+                    routing = Some(Error::Routing { host, port });
+                }
+                Some(_) => (),
+                None => match last_error {
+                    Some(err) => return Err(crate::Error::Server(err)),
+                    None => return Err(crate::Error::Protocol("Never got FEDAUTHINFO token.".into())),
                 },
             }
         }
@@ -216,6 +251,13 @@ where
         Ok(ReceivedToken::Sspi(sspi))
     }
 
+    #[cfg(feature="aad")]
+    async fn get_fed_auth_info(&mut self) -> crate::Result<ReceivedToken> {
+        let fed_auth_info = TokenFedAuthInfo::decode_async(self.conn).await?;
+        event!(Level::TRACE, "Fed auth info response");
+        Ok(ReceivedToken::FedAuthInfo(fed_auth_info))
+    }
+
     pub fn try_unfold(self) -> BoxStream<'a, crate::Result<ReceivedToken>> {
         let stream = futures_util::stream::try_unfold(self, |mut this| async move {
             if this.conn.is_eof() {
@@ -246,6 +288,8 @@ where
                 TokenType::LoginAck => this.get_login_ack().await?,
                 TokenType::Sspi => this.get_sspi().await?,
                 TokenType::FeatureExtAck => this.get_feature_ext_ack().await?,
+                #[cfg(feature="aad")]
+                TokenType::FedAuthInfo => this.get_fed_auth_info().await?,
                 _ => panic!("Token {:?} unimplemented!", ty),
             };
 
