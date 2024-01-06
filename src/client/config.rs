@@ -3,9 +3,9 @@ mod jdbc;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-
 use super::AuthMethod;
 use crate::EncryptionLevel;
+use crate::error::Error;
 use ado_net::*;
 use jdbc::*;
 
@@ -211,6 +211,7 @@ impl Config {
     /// |`TrustServerCertificateCA`|`<path>`|Path to a `pem`, `crt` or `der` certificate file. Cannot be used together with `TrustServerCertificate`|
     /// |`encrypt`|`true`,`false`,`yes`,`no`,`DANGER_PLAINTEXT`|Specifies whether the driver uses TLS to encrypt communication.|
     /// |`Application Name`, `ApplicationName`|`<string>`|Sets the application name for the connection.|
+    /// |`authentication`|`Active Directory MSI`, `Active Directory Managed Identity`, `Active Directory Service Principal`| Specifies a federated authentication method with AAD.|
     ///
     /// [ADO.NET connection string]: https://docs.microsoft.com/en-us/dotnet/framework/data/adonet/connection-strings
     pub fn from_ado_string(s: &str) -> crate::Result<Self> {
@@ -313,8 +314,40 @@ pub(crate) trait ConfigString {
             Some(val) if val.to_lowercase() == "sspi" || Self::parse_bool(val)? => {
                 Ok(AuthMethod::Integrated)
             }
-            _ => Ok(AuthMethod::sql_server(user.unwrap_or(""), pw.unwrap_or(""))),
+            _ => {
+                #[cfg(feature="aad")]
+                match self.dict().get("authentication") {
+                    Some(auth) => {
+                        match auth.to_lowercase().as_str() {
+                            "activedirectorymsi" | "active directory msi" => {
+                                match self.dict().get("msiclientid").map(String::as_str).or(user) {
+                                    Some(client_id) => Ok(AuthMethod::aad_managed_identity_with_client_id(client_id)),
+                                    None => Ok(AuthMethod::aad_managed_identity())
+                                }                                
+                            },
+                            "activedirectorymanagedidentity" | "active directory managed identity" => {
+                                match user {
+                                    Some(client_id) => Ok(AuthMethod::aad_managed_identity_with_client_id(client_id)),
+                                    None => Ok(AuthMethod::aad_managed_identity())
+                                }
+                            },
+                            "activedirectoryserviceprincipal" | "active directory service principal" => {
+                                match (user, pw) {
+                                    (Some(user), Some(pw)) => Ok(AuthMethod::aad_service_principal(user, pw)),
+                                    _ => Err(Error::Conversion("A user and password are required in the connection string for Active Directory Service Principal authentication.".into()))
+                                }
+                            },
+                            _ => unimplemented!("authentication method not supported!")
+                        }
+                    },
+                    _ => Ok(AuthMethod::sql_server(user.unwrap_or(""), pw.unwrap_or("")))
+                }
+
+                #[cfg(not(feature="aad"))]
+                Ok(AuthMethod::sql_server(user.unwrap_or(""), pw.unwrap_or("")))
+            },
         }
+
     }
 
     fn database(&self) -> Option<String> {
