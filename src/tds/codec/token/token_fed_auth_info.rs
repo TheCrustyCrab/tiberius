@@ -1,5 +1,5 @@
 use std::{io::Cursor, mem};
-use crate::{error::Error, sql_read_bytes::SqlReadBytes};
+use crate::{error::Error, sql_read_bytes::SqlReadBytes, tds::codec::FromUtf16Bytes};
 use byteorder::{ReadBytesExt, LittleEndian};
 use futures_util::AsyncReadExt;
 
@@ -9,6 +9,7 @@ const FED_AUTH_INFOID_SPN: u8 = 0x02;
 
 /// Federated authentication information provided by the server.
 #[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct TokenFedAuthInfo {
     sts_url: String,
     spn: String
@@ -45,12 +46,11 @@ impl TokenFedAuthInfo {
             let info_id = option_cursor.read_u8()?;
             let info_data_len = option_cursor.read_u32::<LittleEndian>()? as usize;
             let info_data_offset = option_cursor.read_u32::<LittleEndian>()? as usize - 4; // from optionCount
-            let data = &bytes[info_data_offset..info_data_offset+info_data_len];
-            let data_unicode = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u16, data.len() / 2) };
-            let data_text = String::from_utf16_lossy(data_unicode);
+            let data_bytes = &bytes[info_data_offset..info_data_offset+info_data_len];
+            let data = String::from_utf16_bytes(data_bytes)?;
             match info_id {
-                FED_AUTH_INFOID_STSURL => sts_url = Some(data_text),
-                FED_AUTH_INFOID_SPN => spn = Some(data_text),
+                FED_AUTH_INFOID_STSURL => sts_url = Some(data),
+                FED_AUTH_INFOID_SPN => spn = Some(data),
                 _ => {}
             };
         }
@@ -59,5 +59,56 @@ impl TokenFedAuthInfo {
             (Some(sts_url), Some(spn)) => Ok(Self {sts_url, spn}),
             _ => Err(Error::Protocol("Failed to read FedAuthInfo".into()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::{BytesMut, BufMut};
+    use crate::{sql_read_bytes::test_utils::IntoSqlReadBytes, tds::codec::ToUtf16Bytes};
+
+    #[tokio::test]
+    async fn decode_succeeds() {
+        let mut fed_auth_info_bytes = BytesMut::new();
+
+        let spn = "https://database.windows.net";
+        let spn_bytes = spn.to_utf16_bytes();
+        let sts_url = "https://login.microsoft.com/tenant";
+        let sts_url_bytes = sts_url.to_utf16_bytes();
+
+        let option_count = 2;
+        let total_option_size = option_count * 9;
+        let token_length = 4 + total_option_size + spn_bytes.len() as u32 + sts_url_bytes.len() as u32;
+        fed_auth_info_bytes.put_u32_le(token_length);
+        fed_auth_info_bytes.put_u32_le(option_count);
+
+        let data_start_index = total_option_size + 4;
+
+        // option 1: sts url
+        fed_auth_info_bytes.put_u8(FED_AUTH_INFOID_STSURL); // info id
+        fed_auth_info_bytes.put_u32_le(sts_url_bytes.len() as u32); // info data length
+        fed_auth_info_bytes.put_u32_le(data_start_index); // info data offset
+
+        // option 2: spn
+        fed_auth_info_bytes.put_u8(FED_AUTH_INFOID_SPN); // info id
+        fed_auth_info_bytes.put_u32_le(spn_bytes.len() as u32); // info data length
+        fed_auth_info_bytes.put_u32_le(data_start_index + sts_url_bytes.len() as u32); // info data offset
+
+        // option 1 data
+        fed_auth_info_bytes.put(sts_url_bytes.as_ref());
+
+        // option 2 data
+        fed_auth_info_bytes.put(spn_bytes.as_ref());
+
+        let fed_auth_info = 
+            TokenFedAuthInfo::decode_async(&mut fed_auth_info_bytes.into_sql_read_bytes()).await;
+
+        assert_eq!(Ok(
+            TokenFedAuthInfo {
+                spn: String::from("https://database.windows.net"),
+                sts_url: String::from("https://login.microsoft.com/tenant")
+            }
+        ), fed_auth_info)
     }
 }
