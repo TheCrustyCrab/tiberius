@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use super::AuthMethod;
 use crate::EncryptionLevel;
-use crate::error::Error;
 use ado_net::*;
 use jdbc::*;
 
@@ -334,7 +333,7 @@ pub(crate) trait ConfigString {
                             "activedirectoryserviceprincipal" | "active directory service principal" => {
                                 match (user, pw) {
                                     (Some(user), Some(pw)) => Ok(AuthMethod::aad_service_principal(user, pw)),
-                                    _ => Err(Error::Conversion("A user and password are required in the connection string for Active Directory Service Principal authentication.".into()))
+                                    _ => Err(crate::Error::Conversion("A user and password are required in the connection string for Active Directory Service Principal authentication.".into()))
                                 }
                             },
                             _ => unimplemented!("authentication method not supported!")
