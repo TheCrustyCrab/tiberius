@@ -1,4 +1,4 @@
-use super::{Encode, ToUtf16Bytes};
+use super::{Encode, ToUtf16BytesLe};
 use byteorder::{LittleEndian, WriteBytesExt};
 use bytes::BytesMut;
 use enumflags2::{bitflags, BitFlags};
@@ -413,7 +413,7 @@ impl<'a> Encode<BytesMut> for LoginMessage<'a> {
                     cursor.write_u8(workflow)?;
                 },
                 FedAuthLibrary::SecurityToken{ token, nonce } => {
-                    let token = token.to_utf16_bytes();
+                    let token = token.to_utf16_bytes_le();
         
                     // options (1) + TokenLength(4) + Token.length + nonce.length
                     let feature_ext_length =

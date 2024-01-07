@@ -1,5 +1,5 @@
 use std::{io::Cursor, mem};
-use crate::{error::Error, sql_read_bytes::SqlReadBytes, tds::codec::FromUtf16Bytes};
+use crate::{error::Error, sql_read_bytes::SqlReadBytes, tds::codec::FromUtf16BytesLe};
 use byteorder::{ReadBytesExt, LittleEndian};
 use futures_util::AsyncReadExt;
 
@@ -47,7 +47,7 @@ impl TokenFedAuthInfo {
             let info_data_len = option_cursor.read_u32::<LittleEndian>()? as usize;
             let info_data_offset = option_cursor.read_u32::<LittleEndian>()? as usize - 4; // from optionCount
             let data_bytes = &bytes[info_data_offset..info_data_offset+info_data_len];
-            let data = String::from_utf16_bytes(data_bytes)?;
+            let data = String::from_utf16_bytes_le(data_bytes)?;
             match info_id {
                 FED_AUTH_INFOID_STSURL => sts_url = Some(data),
                 FED_AUTH_INFOID_SPN => spn = Some(data),
@@ -66,16 +66,16 @@ impl TokenFedAuthInfo {
 mod tests {
     use super::*;
     use bytes::{BytesMut, BufMut};
-    use crate::{sql_read_bytes::test_utils::IntoSqlReadBytes, tds::codec::ToUtf16Bytes};
+    use crate::{sql_read_bytes::test_utils::IntoSqlReadBytes, tds::codec::ToUtf16BytesLe};
 
     #[tokio::test]
-    async fn decode_succeeds() {
+    async fn decode_token_fed_auth_info() {
         let mut fed_auth_info_bytes = BytesMut::new();
 
         let spn = "https://database.windows.net";
-        let spn_bytes = spn.to_utf16_bytes();
+        let spn_bytes = spn.to_utf16_bytes_le();
         let sts_url = "https://login.microsoft.com/tenant";
-        let sts_url_bytes = sts_url.to_utf16_bytes();
+        let sts_url_bytes = sts_url.to_utf16_bytes_le();
 
         let option_count = 2;
         let total_option_size = option_count * 9;
