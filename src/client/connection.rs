@@ -616,7 +616,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SqlReadBytes for Connection<S> {
 mod aad {
     use std::borrow::Cow;
     use azure_core::auth::{TokenCredential, AccessToken};
-    use azure_identity::{ImdsManagedIdentityCredential, DefaultAzureCredential, DefaultAzureCredentialEnum, TokenCredentialOptions, ClientSecretCredential};
+    use azure_identity::{ImdsManagedIdentityCredential, TokenCredentialOptions, ClientSecretCredential};
     use futures_util::{AsyncRead, AsyncWrite};
     use crate::{client::{AADManagedIdentityAuth, AADServicePrincipalAuth}, tds::codec::{TokenFedAuthInfo, FedAuthToken, PacketHeader}, error::Error};
     use super::Connection;
