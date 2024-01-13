@@ -10,7 +10,7 @@ impl ToUtf16BytesLe for str {
     fn to_utf16_bytes_le(&self) -> Vec<u8> {
         self
             .encode_utf16()
-            .flat_map(|word| [(word & 0xFF) as u8, (word & 0xFF00) as u8])
+            .flat_map(|word| [(word & 0xFF) as u8, ((word & 0xFF00) >> 8) as u8])
             .collect()
     }
 }
@@ -57,11 +57,11 @@ impl FromUtf16BytesLe for String {
 mod tests {
     use super::{ToUtf16BytesLe, FromUtf16BytesLe};
 
-    const HELLO_WORLD_UTF16_BYTES_LE: [u8; 26] = [104, 0, 101, 0, 108, 0, 108, 0, 111, 0, 44, 0, 32, 0, 119, 0, 111, 0, 114, 0, 108, 0, 100, 0, 33, 0];
+    const HELLO_WORLD_UTF16_BYTES_LE: [u8; 30] = [104, 0, 101, 0, 108, 0, 108, 0, 111, 0, 44, 0, 32, 0, 119, 0, 111, 0, 114, 0, 108, 0, 100, 0, 33, 0, 61, 216, 128, 222];
 
     #[test]
     fn to_utf16_bytes_le_succeeds() {
-        let text = "hello, world!";
+        let text = "hello, world!🚀";
 
         let text_utf16_bytes = text.to_utf16_bytes_le();
 
@@ -73,17 +73,17 @@ mod tests {
         let text = String::from_utf16_bytes_le(&HELLO_WORLD_UTF16_BYTES_LE);
 
         assert!(text.is_ok());
-        assert_eq!(String::from("hello, world!"), text.unwrap());
+        assert_eq!(String::from("hello, world!🚀"), text.unwrap());
     }
 
     #[test]
     fn roundtrip_from_utf16_bytes_le_to_utf16_bytes_le() {
-        let text = "hello, world!";
+        let text = "hello, world!🚀";
 
         let text_utf16_bytes = text.to_utf16_bytes_le();
         let text_again = String::from_utf16_bytes_le(&text_utf16_bytes);
 
         assert!(text_again.is_ok());
-        assert_eq!(String::from("hello, world!"), text_again.unwrap());
+        assert_eq!(String::from("hello, world!🚀"), text_again.unwrap());
     }
 }
