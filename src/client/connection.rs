@@ -633,17 +633,16 @@ mod aad {
             if let Some(client_id) = auth.client_id() {
                 managed_identity_credential = managed_identity_credential.with_client_id(client_id);
             }
-            let msi_credential_flow = DefaultAzureCredential::with_sources(vec![
-                DefaultAzureCredentialEnum::ManagedIdentity(managed_identity_credential)
-            ]);
 
             let spn = fed_auth_info.spn();
             let scope = Self::get_scope(spn);
 
-            if let Ok(access_token) = msi_credential_flow.get_token(&[scope.as_ref()]).await {
-                self.send_fed_auth_token(access_token).await
-            } else {
-                Err(Error::Protocol("Failed to retrieve federated auth token for managed identity".into()))
+            match managed_identity_credential.get_token(&[scope.as_ref()]).await {
+                Ok(access_token) => self.send_fed_auth_token(access_token).await,
+                Err(e) => {
+                    println!("{e:?}");
+                    Err(Error::Protocol("Failed to retrieve federated auth token for managed identity".into()))
+                }
             }
         }
 
@@ -669,7 +668,7 @@ mod aad {
             let credential_options = TokenCredentialOptions::new(
                 azure_core::Url::parse(authority).unwrap());
             
-            let client_credential_flow = ClientSecretCredential::new(
+            let client_credential = ClientSecretCredential::new(
                 azure_core::new_http_client(),
                 audience.to_string(), 
                 auth.client_id().to_string(), 
@@ -679,7 +678,7 @@ mod aad {
 
             let scope = Self::get_scope(spn);
             
-            if let Ok(access_token) = client_credential_flow.get_token(&[scope.as_ref()]).await {
+            if let Ok(access_token) = client_credential.get_token(&[scope.as_ref()]).await {
                 self.send_fed_auth_token(access_token).await
             } else {
                 Err(Error::Protocol("Failed to retrieve federated auth token for service principal".into()))
